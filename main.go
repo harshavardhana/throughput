@@ -7,7 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,6 +35,16 @@ func main() {
 					Name:  "duration",
 					Usage: "duration",
 					Value: "10",
+				},
+				cli.StringFlag{
+					Name:  "size",
+					Usage: "size",
+					Value: "128MiB",
+				},
+				cli.IntFlag{
+					Name:  "scale",
+					Usage: "scale",
+					Value: 1,
 				},
 				cli.BoolFlag{
 					Name:  "directio",
@@ -144,157 +154,137 @@ func (c *clientReader) Read(b []byte) (n int, err error) {
 
 func runClient(ctx *cli.Context) {
 	server := ctx.String("server")
-	durationStr := ctx.String("duration")
-	duration, err := strconv.Atoi(durationStr)
+	scale := ctx.Int("scale")
+	sizeStr := ctx.String("size")
+	size, err := humanize.ParseBytes(sizeStr)
 	if err != nil {
 		log.Fatal(err)
 	}
-	dio := ctx.Bool("directio")
 
+	dio := ctx.Bool("directio")
 	if dio && server != "" {
 		fmt.Println(`for directio on the server side, --directio needs to be passed to "througput server" command`)
 	}
-
-	blkSize := 4 * 1024 * 1024
 
 	files := ctx.Args()
 	if len(files) == 0 {
 		cli.ShowCommandHelpAndExit(ctx, "", 1)
 	}
 	doneCh := make(chan struct{})
-	transferCh := make(chan int)
+	t1 := time.Now()
+	var wg sync.WaitGroup
 	for _, file := range files {
-		go func(file string) {
-			r := &clientReader{0, doneCh}
-			if server == "" {
-				filePath := file
-				var flag int
-				flag = os.O_CREATE | os.O_WRONLY
-				if dio {
-					flag = flag | syscall.O_DIRECT
-				}
-				f, err := os.OpenFile(filePath, flag, 0644)
+		for i := 0; i < scale; i++ {
+			wg.Add(1)
+			go func(file string, i int) {
+				defer wg.Done()
+				r := &clientReader{0, doneCh}
+				req, err := http.NewRequest(http.MethodPost, server+"/minio/storage/v6"+file+"/createfile", io.LimitReader(r, int64(size)))
 				if err != nil {
 					log.Fatal(err)
 				}
-				defer f.Close()
-				b := directio.AlignedBlock(blkSize)
-				_, err = io.CopyBuffer(f, r, b)
+				req.URL.RawQuery = fmt.Sprintf("volume=testbucket&file-path=tmpfile%d&length=%d", i, size)
+				_, err = http.DefaultClient.Do(req)
 				if err != nil {
 					log.Fatal(err)
 				}
-			} else {
-				req, err := http.NewRequest(http.MethodPut, server+file, r)
-				if err != nil {
-					log.Fatal(err)
-				}
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
-					log.Fatal(err)
-				}
-				if resp.StatusCode != http.StatusOK {
-					log.Fatal(err)
-				}
-			}
-			transferCh <- r.n
-		}(file)
-	}
-	time.Sleep(time.Duration(duration) * time.Second)
-	close(doneCh)
-	totalWritten := 0
-	for _ = range files {
-		n := <-transferCh
-		totalWritten += n
-	}
-	fmt.Println("Write speed: ", humanize.Bytes(uint64(totalWritten/duration)))
-	doneCh = make(chan struct{})
-	for _, file := range files {
-		go func(file string) {
-			b := directio.AlignedBlock(blkSize)
-			totalRead := 0
-			for {
-				if server == "" {
-					var flag int
-					flag = os.O_RDONLY
-					if dio {
-						flag = flag | syscall.O_DIRECT
-					}
-					f, err := os.OpenFile(file, flag, 0644)
-					if err != nil {
-						log.Fatal(err)
-					}
-
-					for {
-						select {
-						case <-doneCh:
-							transferCh <- totalRead
-							f.Close()
-							return
-						default:
-						}
-						n, err := f.Read(b)
-						totalRead += n
-						if err == io.EOF {
-							f.Close()
-							break
-						}
-						if err != nil {
-							log.Fatal(err)
-						}
-					}
-				} else {
-					resp, err := http.Get(server + file)
-					if err != nil {
-						log.Fatal(err)
-					}
-					if resp.StatusCode != http.StatusOK {
-						log.Fatal(err)
-					}
-					for {
-						select {
-						case <-doneCh:
-							resp.Body.Close()
-							transferCh <- totalRead
-							return
-						default:
-						}
-						n, err := resp.Body.Read(b)
-						totalRead += n
-						if err == io.EOF {
-							resp.Body.Close()
-							break
-						}
-						if err != nil {
-							log.Fatal(err)
-						}
-					}
-				}
-			}
-		}(file)
-	}
-	time.Sleep(time.Duration(duration) * time.Second)
-	close(doneCh)
-	totalRead := 0
-	for _ = range files {
-		n := <-transferCh
-		totalRead += n
-	}
-	fmt.Println("Read speed: ", humanize.Bytes(uint64(totalRead/duration)))
-	for _, file := range files {
-		if server == "" {
-			os.Remove(file)
-		} else {
-			req, err := http.NewRequest(http.MethodDelete, server+file, nil)
-			if err != nil {
-				log.Fatal(err)
-			}
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				log.Fatal(err)
-			}
-			if resp.StatusCode != http.StatusOK {
-				log.Fatal(err)
-			}
+			}(file, i)
 		}
 	}
+	wg.Wait()
+	totalWritten := int(size) * len(files) * scale
+	t2 := time.Now()
+	timeD := int(t2.Sub(t1).Seconds())
+	fmt.Println("Write speed: ", humanize.Bytes(uint64(totalWritten/timeD)))
+	fmt.Println("Write speed per drive: ", humanize.Bytes(uint64(totalWritten/len(files)*scale/timeD)))
+	// doneCh = make(chan struct{})
+	// for _, file := range files {
+	// 	go func(file string) {
+	// 		b := directio.AlignedBlock(blkSize)
+	// 		totalRead := 0
+	// 		for {
+	// 			if server == "" {
+	// 				var flag int
+	// 				flag = os.O_RDONLY
+	// 				if dio {
+	// 					flag = flag | syscall.O_DIRECT
+	// 				}
+	// 				f, err := os.OpenFile(file, flag, 0644)
+	// 				if err != nil {
+	// 					log.Fatal(err)
+	// 				}
+
+	// 				for {
+	// 					select {
+	// 					case <-doneCh:
+	// 						transferCh <- totalRead
+	// 						f.Close()
+	// 						return
+	// 					default:
+	// 					}
+	// 					n, err := f.Read(b)
+	// 					totalRead += n
+	// 					if err == io.EOF {
+	// 						f.Close()
+	// 						break
+	// 					}
+	// 					if err != nil {
+	// 						log.Fatal(err)
+	// 					}
+	// 				}
+	// 			} else {
+	// 				resp, err := http.Get(server + file)
+	// 				if err != nil {
+	// 					log.Fatal(err)
+	// 				}
+	// 				if resp.StatusCode != http.StatusOK {
+	// 					log.Fatal(err)
+	// 				}
+	// 				for {
+	// 					select {
+	// 					case <-doneCh:
+	// 						resp.Body.Close()
+	// 						transferCh <- totalRead
+	// 						return
+	// 					default:
+	// 					}
+	// 					n, err := resp.Body.Read(b)
+	// 					totalRead += n
+	// 					if err == io.EOF {
+	// 						resp.Body.Close()
+	// 						break
+	// 					}
+	// 					if err != nil {
+	// 						log.Fatal(err)
+	// 					}
+	// 				}
+	// 			}
+	// 		}
+	// 	}(file)
+	// }
+	// time.Sleep(time.Duration(duration) * time.Second)
+	// close(doneCh)
+	// totalRead := 0
+	// for _ = range files {
+	// 	n := <-transferCh
+	// 	totalRead += n
+	// }
+	// fmt.Println("Read speed: ", humanize.Bytes(uint64(totalRead/duration)))
+	// for _, file := range files {
+	// 	if server == "" {
+	// 		os.Remove(file)
+	// 	} else {
+	// 		req, err := http.NewRequest(http.MethodDelete, server+file, nil)
+	// 		if err != nil {
+	// 			log.Fatal(err)
+	// 		}
+	// 		resp, err := http.DefaultClient.Do(req)
+	// 		if err != nil {
+	// 			log.Fatal(err)
+	// 		}
+	// 		if resp.StatusCode != http.StatusOK {
+	// 			log.Fatal(err)
+	// 		}
+	// 	}
+	// }
 }
